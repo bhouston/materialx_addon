@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Script to install the MaterialX addon to the latest Blender version on macOS.
+Script to install (or upgrade) the MaterialX addon to the latest Blender version on macOS or Windows.
+
 This script will:
-1. Find the latest Blender installation
-2. Remove any existing MaterialX addon
+1. Detect the latest Blender installation available on your system
+2. Remove any existing MaterialX addon from that Blender installation
 3. Copy the current addon to Blender's addon directory
-4. Handle errors appropriately
+4. Handle errors and edge-cases appropriately
+
+Currently supported operating systems: macOS, Windows
 """
 
 import os
@@ -17,107 +20,132 @@ from pathlib import Path
 import platform
 
 def find_latest_blender():
-    """Find the latest Blender installation on macOS."""
-    if platform.system() != 'Darwin':
-        raise RuntimeError("This script is designed for macOS only")
+    """Find the latest Blender installation on the current system (macOS or Windows)."""
+    system = platform.system()
     
-    # Common Blender installation paths on macOS
-    blender_paths = [
-        "/Applications/Blender.app",
-        "/Applications/Blender 4.5.app",
-        "/Applications/Blender 4.4.app",
-        "/Applications/Blender 4.3.app",
-        "/Applications/Blender 4.2.app",
-        "/Applications/Blender 4.1.app",
-        "/Applications/Blender 4.0.app",
-    ]
+    # ---------------------------------
+    # macOS logic
+    # ---------------------------------
+    if system == 'Darwin':
+        blender_paths = [
+            "/Applications/Blender.app",
+            "/Applications/Blender 4.5.app",
+            "/Applications/Blender 4.4.app",
+            "/Applications/Blender 4.3.app",
+            "/Applications/Blender 4.2.app",
+            "/Applications/Blender 4.1.app",
+            "/Applications/Blender 4.0.app",
+        ]
+        # Also check for any Blender*.app in Applications
+        applications_dir = "/Applications"
+        if os.path.exists(applications_dir):
+            blender_apps = glob.glob(os.path.join(applications_dir, "Blender*.app"))
+            blender_paths.extend(blender_apps)
     
-    # Also check for any Blender*.app in Applications
-    applications_dir = "/Applications"
-    if os.path.exists(applications_dir):
-        blender_apps = glob.glob(os.path.join(applications_dir, "Blender*.app"))
-        blender_paths.extend(blender_apps)
+    # ---------------------------------
+    # Windows logic
+    # ---------------------------------
+    elif system == 'Windows':
+        blender_paths = []
+        program_dirs = []
+        if 'PROGRAMFILES' in os.environ:
+            program_dirs.append(os.environ['PROGRAMFILES'])
+        if 'PROGRAMFILES(X86)' in os.environ:
+            program_dirs.append(os.environ['PROGRAMFILES(X86)'])
+        
+        for base in program_dirs:
+            foundation_dir = os.path.join(base, 'Blender Foundation')
+            if os.path.exists(foundation_dir):
+                blender_paths.extend(glob.glob(os.path.join(foundation_dir, 'Blender*')))
+        
+        # If Blender is on PATH, add its directory as a candidate
+        blender_on_path = shutil.which('blender')
+        if blender_on_path:
+            blender_paths.append(os.path.dirname(blender_on_path))
+    else:
+        raise RuntimeError(f"Unsupported operating system: {system}")
     
-    # Find the latest version
+    # ---------------------------------
+    # Evaluate candidates and pick the newest
+    # ---------------------------------
     latest_blender = None
     latest_version = (0, 0, 0)
     
     for blender_path in blender_paths:
-        if os.path.exists(blender_path):
-            # Extract version from path or get it from the app
-            version_str = os.path.basename(blender_path).replace("Blender", "").replace(".app", "").strip()
-            
-            if version_str:
-                # Parse version like "4.5" or "4.5.0"
+        if not os.path.exists(blender_path):
+            continue
+        
+        # -----------------------------------------------------
+        # 1. Try to parse version from the directory/app name
+        # -----------------------------------------------------
+        dir_name = os.path.basename(blender_path)
+        version_str = dir_name.replace('Blender', '').replace('.app', '').strip()
+        if version_str.startswith('-'):
+            version_str = version_str[1:]
+        
+        parsed_from_name = False
+        if version_str:
+            try:
+                version_parts = [int(x) for x in version_str.split('.')]
+                while len(version_parts) < 3:
+                    version_parts.append(0)
+                version_tuple = tuple(version_parts[:3])
+                parsed_from_name = True
+            except ValueError:
+                version_tuple = (0, 0, 0)
+        else:
+            version_tuple = (0, 0, 0)
+        
+        # -----------------------------------------------------
+        # 2. If parsing failed, query the executable directly
+        # -----------------------------------------------------
+        if not parsed_from_name:
+            if system == 'Darwin':
+                blender_exe = os.path.join(blender_path, "Contents/MacOS/Blender")
+            else:  # Windows
+                blender_exe = os.path.join(blender_path, "blender.exe")
+        
+            if os.path.exists(blender_exe):
                 try:
-                    version_parts = [int(x) for x in version_str.split('.')]
-                    # Pad to 3 parts
-                    while len(version_parts) < 3:
-                        version_parts.append(0)
-                    version_tuple = tuple(version_parts[:3])
-                    
-                    if version_tuple > latest_version:
-                        latest_version = version_tuple
-                        latest_blender = blender_path
-                except ValueError:
-                    # If we can't parse the version, try to get it from the app
-                    try:
-                        result = subprocess.run([
-                            os.path.join(blender_path, "Contents/MacOS/Blender"),
-                            "--version"
-                        ], capture_output=True, text=True, timeout=10)
-                        
-                        if result.returncode == 0:
-                            # Parse version from output like "Blender 4.5.0"
-                            output = result.stdout.strip()
-                            if "Blender" in output:
-                                version_match = output.split("Blender")[1].strip().split()[0]
-                                version_parts = [int(x) for x in version_match.split('.')]
-                                while len(version_parts) < 3:
-                                    version_parts.append(0)
-                                version_tuple = tuple(version_parts[:3])
-                                
-                                if version_tuple > latest_version:
-                                    latest_version = version_tuple
-                                    latest_blender = blender_path
-                    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-                        continue
-            else:
-                # No version in name, try to get it from the app
-                try:
-                    result = subprocess.run([
-                        os.path.join(blender_path, "Contents/MacOS/Blender"),
-                        "--version"
-                    ], capture_output=True, text=True, timeout=10)
-                    
-                    if result.returncode == 0:
-                        output = result.stdout.strip()
-                        if "Blender" in output:
-                            version_match = output.split("Blender")[1].strip().split()[0]
-                            version_parts = [int(x) for x in version_match.split('.')]
-                            while len(version_parts) < 3:
-                                version_parts.append(0)
-                            version_tuple = tuple(version_parts[:3])
-                            
-                            if version_tuple > latest_version:
-                                latest_version = version_tuple
-                                latest_blender = blender_path
+                    result = subprocess.run([blender_exe, "--version"], capture_output=True, text=True, timeout=10)
+                    if result.returncode == 0 and "Blender" in result.stdout:
+                        version_match = result.stdout.split("Blender")[1].strip().split()[0]
+                        version_parts = [int(x) for x in version_match.split('.')]
+                        while len(version_parts) < 3:
+                            version_parts.append(0)
+                        version_tuple = tuple(version_parts[:3])
                 except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
-                    continue
+                    version_tuple = (0, 0, 0)
+        
+        # Keep track of the newest version found
+        if version_tuple > latest_version:
+            latest_version = version_tuple
+            latest_blender = blender_path
     
     if not latest_blender:
         raise RuntimeError("Could not find any Blender installation on this system")
     
     print(f"Found Blender {latest_version[0]}.{latest_version[1]}.{latest_version[2]} at: {latest_blender}")
     return latest_blender
+    
+
 
 def get_blender_addon_directory(blender_path):
     """Get the addon directory for the given Blender installation."""
-    # On macOS, Blender addons are typically in:
-    # ~/Library/Application Support/Blender/[version]/scripts/addons/
+    system = platform.system()
     
-    home_dir = os.path.expanduser("~")
-    support_dir = os.path.join(home_dir, "Library", "Application Support", "Blender")
+    if system == 'Darwin':
+        # macOS: ~/Library/Application Support/Blender/<version>/scripts/addons/
+        home_dir = os.path.expanduser("~")
+        support_dir = os.path.join(home_dir, "Library", "Application Support", "Blender")
+    elif system == 'Windows':
+        # Windows: %APPDATA%\Blender Foundation\Blender\<version>\scripts\addons
+        appdata = os.getenv("APPDATA")
+        if not appdata:
+            raise RuntimeError("APPDATA environment variable not set; cannot locate Blender addon directory")
+        support_dir = os.path.join(appdata, "Blender Foundation", "Blender")
+    else:
+        raise RuntimeError(f"Unsupported operating system: {system}")
     
     if not os.path.exists(support_dir):
         raise RuntimeError(f"Blender support directory not found: {support_dir}")

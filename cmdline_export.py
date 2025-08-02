@@ -36,11 +36,28 @@ import os
 import tempfile
 from pathlib import Path
 import json
+import shutil
+import glob
+
+
+import re
+
+
+def _extract_version_from_path(path: str):
+    """Try to extract a version tuple (major, minor, patch) from a Blender path."""
+    # Look for "Blender 4.5" or "Blender4.5" etc.
+    match = re.search(r"Blender\s*([0-9]+)(?:\.([0-9]+))?(?:\.([0-9]+))?", path, re.IGNORECASE)
+    if match:
+        parts = [int(p) if p is not None else 0 for p in match.groups()]
+        while len(parts) < 3:
+            parts.append(0)
+        return tuple(parts[:3])
+    return (0, 0, 0)
 
 
 def find_blender_executable():
-    """Find the Blender executable on the system."""
-    # Common Blender installation paths
+    """Find the newest Blender executable on the system."""
+    # Accumulate candidate paths
     possible_paths = []
     
     # macOS
@@ -56,51 +73,95 @@ def find_blender_executable():
         "/opt/blender/blender",
     ])
     
-    # Windows
-    possible_paths.extend([
-        "C:\\Program Files\\Blender Foundation\\Blender\\blender.exe",
-        "C:\\Program Files (x86)\\Blender Foundation\\Blender\\blender.exe",
-    ])
+    # Windows – search common install locations, including versioned folders
+    if os.name == "nt":
+        program_dirs = []
+        if 'PROGRAMFILES' in os.environ:
+            program_dirs.append(os.environ['PROGRAMFILES'])
+        if 'PROGRAMFILES(X86)' in os.environ:
+            program_dirs.append(os.environ['PROGRAMFILES(X86)'])
+        
+        for base in program_dirs:
+            foundation_dir = os.path.join(base, 'Blender Foundation')
+            if os.path.exists(foundation_dir):
+                # Blender\blender.exe OR Blender 4.0\blender.exe etc.
+                for exe in glob.glob(os.path.join(foundation_dir, 'Blender*', 'blender.exe')):
+                    possible_paths.append(exe)
+
     
-    # Check if blender is in PATH
-    try:
-        result = subprocess.run(["which", "blender"], capture_output=True, text=True)
-        if result.returncode == 0:
-            possible_paths.append(result.stdout.strip())
-    except FileNotFoundError:
-        pass
+    # Check if blender is in PATH (cross-platform)
+    blender_on_path = shutil.which("blender" if os.name != "nt" else "blender.exe")
+    if blender_on_path:
+        possible_paths.append(blender_on_path)
     
-    # Check each possible path
+    # Deduplicate
+    possible_paths = list(dict.fromkeys(possible_paths))
+
+    # Evaluate candidates and pick newest version
+    latest_path = None
+    latest_version = (0, 0, 0)
     for path in possible_paths:
-        if os.path.exists(path) and os.access(path, os.X_OK):
-            return path
-    
-    return None
+        if not (os.path.exists(path) and os.access(path, os.X_OK)):
+            continue
+        version = _extract_version_from_path(path)
+        # If we couldn't parse version from path, fall back to --version query (expensive)
+        if version == (0, 0, 0):
+            try:
+                result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and "Blender" in result.stdout:
+                    match = re.search(r"Blender\s+([0-9]+)\.([0-9]+)(?:\.([0-9]+))?", result.stdout)
+                    if match:
+                        parts = [int(p) if p is not None else 0 for p in match.groups()]
+                        while len(parts) < 3:
+                            parts.append(0)
+                        version = tuple(parts[:3])
+            except Exception:
+                pass
+        if version > latest_version:
+            latest_version = version
+            latest_path = path
+    return latest_path
 
 
-def create_blender_script(blend_file, material_name, output_mtlx_file, options):
+def create_blender_script(blend_file, material_name, output_mtlx_file, options, project_root):
     """Create a temporary Blender Python script to perform the export."""
     
     # Convert options to Python literal format
     options_str = str(options).replace("'", '"')
     
+    # Convert file paths to POSIX style so they are safe to embed in the
+    # generated script regardless of host operating system (Blender on
+    # Windows happily accepts forward slashes).
+    safe_blend_path = Path(blend_file).resolve().as_posix()
+    safe_output_path = Path(output_mtlx_file).resolve().as_posix()
+    project_root_posix = Path(project_root).resolve().as_posix()
+    
     script_content = f'''
+import sys, os
+# Ensure our addon is importable
+root_dir = r"{project_root_posix}"
+if root_dir not in sys.path:
+    sys.path.insert(0, root_dir)
+
 import bpy
+import logging
 import sys
 import os
 
-# Add the current directory to Python path to find the exporter
-current_dir = os.path.dirname(os.path.abspath(__file__))
-if current_dir not in sys.path:
-    sys.path.insert(0, current_dir)
+# Simple stdout logger
+logger = logging.getLogger("MaterialXExporter")
+logger.setLevel(logging.INFO)
+_handler = logging.StreamHandler(stream=sys.stdout)
+_handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(_handler)
 
 try:
     # Import the MaterialX exporter
     from materialx_addon.blender_materialx_exporter import export_material_to_materialx
     
     # Load the blend file
-    print(f"Loading blend file: {blend_file}")
-    bpy.ops.wm.open_mainfile(filepath="{blend_file}")
+    print(f"Loading blend file: {safe_blend_path}")
+    bpy.ops.wm.open_mainfile(filepath="{safe_blend_path}")
     
     # Find the material
     material = bpy.data.materials.get("{material_name}")
@@ -117,8 +178,8 @@ try:
     export_options = {options_str}
     
     # Export the material
-    print(f"Exporting material to: {output_mtlx_file}")
-    success = export_material_to_materialx(material, "{output_mtlx_file}", export_options)
+    print(f"Exporting material to: {safe_output_path}")
+    success = export_material_to_materialx(material, "{safe_output_path}", logger, export_options)
     
     if success:
         print("SUCCESS: Material exported successfully")
@@ -141,7 +202,7 @@ except Exception as e:
     return script_content
 
 
-def run_blender_export(blend_file, material_name, output_mtlx_file, options, blender_path=None):
+def run_blender_export(blend_file, material_name, output_mtlx_file, options, blender_path=None, verbose=False):
     """Run Blender in headless mode to export the material."""
     
     # Find Blender executable if not provided
@@ -155,7 +216,8 @@ def run_blender_export(blend_file, material_name, output_mtlx_file, options, ble
     print(f"Using Blender executable: {blender_path}")
     
     # Create temporary script file
-    script_content = create_blender_script(blend_file, material_name, output_mtlx_file, options)
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    script_content = create_blender_script(blend_file, material_name, output_mtlx_file, options, project_root)
     
     with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
         script_path = f.name
@@ -165,40 +227,57 @@ def run_blender_export(blend_file, material_name, output_mtlx_file, options, ble
         # Prepare Blender command
         cmd = [
             blender_path,
-            "--background",  # Run in headless mode
+            "--background",              # Headless
+            "--factory-startup",         # Skip user prefs/add-ons for speed
+            "--disable-autoexec",        # Safety
             "--python", script_path,
-            "--",  # End of Blender options
+            "--",                        # End of Blender options
         ]
         
         print(f"Running command: {' '.join(cmd)}")
         
-        # Run Blender
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=os.path.dirname(os.path.abspath(__file__))  # Run from script directory
-        )
-        
-        # Print output
-        if result.stdout:
-            print("STDOUT:")
-            print(result.stdout)
-        
-        if result.stderr:
-            print("STDERR:")
-            print(result.stderr)
-        
-        # Check if export was successful
-        if result.returncode == 0:
-            if os.path.exists(output_mtlx_file):
-                print(f"SUCCESS: Material exported to {output_mtlx_file}")
-                return True
-            else:
-                print(f"ERROR: Output file {output_mtlx_file} was not created")
-                return False
+        if verbose:
+            # Stream output live
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                cwd=os.path.dirname(os.path.abspath(__file__))
+            )
+            try:
+                for line in process.stdout:
+                    print(line.rstrip())
+                process.wait()
+            except KeyboardInterrupt:
+                process.kill()
+                raise
+            returncode = process.returncode
         else:
-            print(f"ERROR: Blender process failed with return code {result.returncode}")
+            # Run Blender and capture output
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                cwd=os.path.dirname(os.path.abspath(__file__))
+            )
+            if result.stdout:
+                print("STDOUT:")
+                print(result.stdout)
+            if result.stderr:
+                print("STDERR:")
+                print(result.stderr)
+            returncode = result.returncode
+        # Evaluate result
+        if returncode == 0 and os.path.exists(output_mtlx_file):
+            print(f"SUCCESS: Material exported to {output_mtlx_file}")
+            return True
+        else:
+            print(f"ERROR: Blender process failed or output file missing (code={returncode})")
             return False
             
     finally:
@@ -237,6 +316,7 @@ def main():
                        help="Active UV map name (default: UVMap)")
     parser.add_argument("--blender-path",
                        help="Path to Blender executable (auto-detected if not specified)")
+    parser.add_argument("--verbose", action="store_true", help="Stream Blender output in real-time")
     
     args = parser.parse_args()
     
@@ -275,7 +355,8 @@ def main():
         args.material_name,
         args.output_mtlx_file,
         options,
-        args.blender_path
+        args.blender_path,
+        args.verbose
     )
     
     if success:

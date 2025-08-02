@@ -1006,7 +1006,9 @@ class MaterialXExporter:
             return
         
         # Compute relative path from .mtlx file to texture
-        rel_path = os.path.relpath(self.texture_path / source_path.name, self.output_path.parent)
+        # MaterialX expects forward-slash paths. Build a relative path and
+        # then normalise to POSIX style so it is portable across OSes.
+        rel_path = os.path.relpath(self.texture_path / source_path.name, self.output_path.parent).replace(os.sep, '/')
         self.texture_paths[str(image.filepath)] = rel_path
         # Copy the texture (overwrite if exists)
         target_path = self.texture_path / source_path.name
